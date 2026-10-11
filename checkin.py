@@ -6,8 +6,10 @@ import html
 import json
 import os
 import re
+import smtplib
 import sys
 from datetime import datetime
+from email.mime.text import MIMEText
 
 import requests
 
@@ -114,14 +116,27 @@ def is_success(result):
 
 
 def checkin(cookie, index):
+    email = "?"
+    points = "?"
+    left_days = "?"
     status_code, status = request(f"{BASE_URL}/api/user/status", "GET", cookie)
     if status_code != 200:
-        log(f"❌ 账号 {index} 获取状态失败: HTTP {status_code} {status}")
-        return False, status
+        message = f"获取状态失败: HTTP {status_code}"
+        log(f"❌ 账号 {index} {message} {status}")
+        return False, {
+            "index": index,
+            "email": email,
+            "points": points,
+            "left_days": left_days,
+            "message": message,
+            "result": status,
+        }
 
     user_data = status.get("data", {}) if isinstance(status, dict) else {}
-    email = user_data.get("email", "?")
-    left_days = user_data.get("leftDays", "?")
+    if isinstance(user_data, dict):
+        email = user_data.get("email", "?")
+        points = user_data.get("points", "?")
+        left_days = user_data.get("leftDays", "?")
 
     code, result = request(
         f"{BASE_URL}/api/user/checkin",
@@ -133,15 +148,58 @@ def checkin(cookie, index):
     success = code == 200 and is_success(result)
     message = result.get("message", "未知") if isinstance(result, dict) else str(result)
     icon = "✅" if success else "❌"
-    log(f"{icon} 用户: {email} | 积分: {user_data.get('points', '?')} | 天数: {left_days} | 结果: {message}")
+    log(f"{icon} 用户: {email} | 积分: {points} | 天数: {left_days} | 结果: {message}")
     if not success:
         log(f"响应详情: HTTP {code}, {result}")
     return success, {
+        "index": index,
         "email": email,
+        "points": points,
         "left_days": left_days,
         "message": message,
         "result": result,
     }
+
+
+def send_email_notification(success_count, total_count, reports_html):
+    smtp_user = os.environ.get("SMTP_USER", "").strip()
+    smtp_password = os.environ.get("SMTP_PASSWORD", "").strip()
+    email_to = os.environ.get("EMAIL_TO", "").strip()
+    if not (smtp_user and smtp_password and email_to):
+        log("ℹ️ 未完整配置 SMTP_USER/SMTP_PASSWORD/EMAIL_TO，跳过邮件通知")
+        return
+
+    smtp_host = os.environ.get("SMTP_HOST", "").strip() or "smtp.qq.com"
+    smtp_port_text = os.environ.get("SMTP_PORT", "").strip() or "465"
+    try:
+        smtp_port = int(smtp_port_text)
+    except ValueError:
+        smtp_port = 465
+
+    recipients = [item.strip() for item in re.split(r"[,\n;]+", email_to) if item.strip()]
+    if not recipients:
+        log("ℹ️ EMAIL_TO 无有效收件人，跳过邮件通知")
+        return
+
+    subject_prefix = os.environ.get("EMAIL_SUBJECT_PREFIX", "").strip() or "GLaDOS签到"
+    subject = f"{subject_prefix} 成功{success_count}/{total_count}"
+    content = (
+        f"<p><b>签到汇总:</b> 成功 {success_count}/{total_count}</p>"
+        f"{reports_html or '<p>没有可推送的结果</p>'}"
+    )
+
+    msg = MIMEText(content, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = ", ".join(recipients)
+
+    try:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, recipients, msg.as_string())
+        log("✅ 邮件通知发送成功")
+    except Exception as exc:
+        log(f"❌ 邮件通知发送失败: {exc}")
 
 
 def pushplus(token, title, content):
@@ -173,18 +231,26 @@ def main():
             success_count += 1
         if isinstance(info, dict):
             reports.append(
-                f"<p><b>账号:</b> {html.escape(str(info.get('email', '?')))}<br>"
+                f"<p><b>账号{html.escape(str(info.get('index', index)))}:</b> "
+                f"{html.escape(str(info.get('email', '?')))}<br>"
+                f"<b>积分:</b> {html.escape(str(info.get('points', '?')))}<br>"
                 f"<b>剩余天数:</b> {html.escape(str(info.get('left_days', '?')))}<br>"
                 f"<b>结果:</b> {html.escape(str(info.get('message', '?')))}</p>"
             )
+
+    report_content = (
+        f"<p><b>签到汇总:</b> 成功 {success_count}/{len(cookies)}</p>"
+        f"{''.join(reports) or '<p>没有可推送的结果</p>'}"
+    )
 
     token = os.environ.get("PUSHPLUS_TOKEN", "")
     if token:
         pushplus(
             token,
             f"GLaDOS签到: 成功{success_count}/{len(cookies)}",
-            "".join(reports) or "没有可推送的结果",
+            report_content,
         )
+    send_email_notification(success_count, len(cookies), "".join(reports))
 
     return 0 if success_count == len(cookies) else 1
 

@@ -38,7 +38,7 @@
 │                                                             │
 │   ③ 配置 cron    ──→  5分钟填好，永久有效                    │
 │                                                             │
-│   ✅ 完成！每天自动签到 + 微信通知                            │
+│   ✅ 完成！每天自动签到 + 微信/QQ邮件通知                     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -391,12 +391,18 @@ else:
 
 ![添加 Secret](images/add-secret.png)
 
-添加以下两个 Secret：
+至少添加以下 Secret：
 
 | Name | Value | 必需 |
 |------|-------|------|
 | `GLADOS_COOKIE` | 第二步组合的 Cookie | ✅ 是 |
 | `PUSHPLUS_TOKEN` | 微信推送 Token（见下方） | ❌ 否 |
+| `SMTP_USER` | 发件 QQ 邮箱（如 `12345678@qq.com`） | ❌ 否 |
+| `SMTP_PASSWORD` | QQ 邮箱 SMTP 授权码（不是登录密码） | ❌ 否 |
+| `EMAIL_TO` | 收件邮箱（多个可用逗号分隔） | ❌ 否 |
+| `SMTP_HOST` | SMTP 服务器（默认 `smtp.qq.com`） | ❌ 否 |
+| `SMTP_PORT` | SMTP 端口（默认 `465`） | ❌ 否 |
+| `EMAIL_SUBJECT_PREFIX` | 邮件标题前缀（可选） | ❌ 否 |
 
 ---
 
@@ -415,6 +421,23 @@ else:
 ![获取 Token](images/pushplus-token.png)
 
 5. 将 Token 添加到 GitHub Secrets，Name 填 `PUSHPLUS_TOKEN`
+
+---
+
+### 第四步补充：配置 QQ 邮箱 SMTP（可选）📧
+
+如需签到后发送邮件通知，请在 Secrets 中配置 `SMTP_USER`、`SMTP_PASSWORD`、`EMAIL_TO`。  
+`SMTP_PASSWORD` 必须填写 QQ 邮箱的 SMTP 授权码，不是 QQ 登录密码。
+
+QQ 邮箱开启 SMTP / 获取授权码（简要）：
+
+1. 登录 QQ 邮箱网页端 → **设置**
+2. 进入 **账户**（或账户与安全）→ 找到 **POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务**
+3. 开启 **SMTP 服务**
+4. 按页面提示完成验证后获取授权码
+5. 将授权码保存到仓库 Secret：`SMTP_PASSWORD`
+
+> 未配置完整邮件 Secret 时，签到流程仍会正常运行，只是跳过邮件发送。
 
 ---
 
@@ -553,11 +576,13 @@ cookie1&cookie2&cookie3
 </details>
 
 <details>
-<summary><b>Q: 没有收到微信推送怎么办？</b></summary>
+<summary><b>Q: 没有收到微信/邮件推送怎么办？</b></summary>
 
 1. 检查 `PUSHPLUS_TOKEN` 是否配置正确
-2. 在 PushPlus 网站测试发送功能是否正常
-3. 查看 Actions 运行日志是否有错误
+2. 检查 `SMTP_USER`、`SMTP_PASSWORD`（授权码）、`EMAIL_TO` 是否都已配置
+3. 如使用 QQ 邮箱，确认已开启 SMTP 服务并使用授权码
+4. 查看 Actions 运行日志是否有错误
+5. 在 PushPlus 网站测试发送功能是否正常（仅微信推送）
 
 </details>
 
