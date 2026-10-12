@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GLaDOS automatic check-in for glados-facility.com."""
 
 import html
 import json
@@ -17,7 +16,6 @@ if sys.platform.startswith("win"):
 
 
 BASE_URL = "https://glados-facility.com"
-DOMAINS = [BASE_URL]
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -92,7 +90,7 @@ def get_cookies():
     return cookies
 
 
-def get_headers(cookie, domain):
+def get_headers(cookie):
     user_agent = (
         os.environ.get("GLADOS_USER_AGENT", "").strip()
         or DEFAULT_USER_AGENT
@@ -101,21 +99,19 @@ def get_headers(cookie, domain):
     return {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=UTF-8",
-        "Origin": domain,
-        "Referer": f"{domain}/console",
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/console",
         "User-Agent": user_agent,
         "Cookie": cookie,
     }
 
 
 def request(url, method, cookie, data=None):
-    domain = BASE_URL
-
     try:
         response = requests.request(
             method,
             url,
-            headers=get_headers(cookie, domain),
+            headers=get_headers(cookie),
             json=data,
             timeout=20,
         )
@@ -147,51 +143,10 @@ def is_success(result):
     )
 
 
-def find_value(data, names):
+def find_points(data):
     """
-    在嵌套字典中查找指定字段。
-    字段名不区分大小写。
-    """
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if str(key).lower() in names and value is not None:
-                return value
-
-        for value in data.values():
-            result = find_value(value, names)
-
-            if result is not None:
-                return result
-
-    elif isinstance(data, list):
-        for item in data:
-            result = find_value(item, names)
-
-            if result is not None:
-                return result
-
-    return None
-
-
-def get_user_info(status):
-    """
-    从状态接口返回内容中提取用户信息。
-    兼容不同版本接口的数据结构。
-    """
-    if not isinstance(status, dict):
-        return {}
-
-    data = status.get("data", status)
-
-    if isinstance(data, dict):
-        return data
-
-    return {}
-
-
-def get_points(status):
-    """
-    兼容不同接口版本可能使用的积分字段名称。
+    尝试从接口返回内容中查找积分。
+    注意：不会把 days 或 leftDays 当成积分。
     """
     point_names = {
         "points",
@@ -202,37 +157,34 @@ def get_points(status):
         "credit",
         "credits",
         "score",
+        "integral",
+        "integrals",
     }
 
-    points = find_value(status, point_names)
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key_name = str(key).replace("_", "").lower()
 
-    if points is None:
-        return "?"
+            if key_name in point_names and value is not None:
+                return value
 
-    return points
+        for value in data.values():
+            result = find_points(value)
 
+            if result is not None:
+                return result
 
-def get_left_days(status):
-    """
-    提取剩余天数。
-    """
-    day_names = {
-        "leftdays",
-        "left_days",
-        "days",
-        "remainingdays",
-        "remaining_days",
-    }
+    elif isinstance(data, list):
+        for item in data:
+            result = find_points(item)
 
-    left_days = find_value(status, day_names)
+            if result is not None:
+                return result
 
-    if left_days is None:
-        return "?"
-
-    return left_days
+    return None
 
 
-def checkin(cookie, index):
+def get_user_status(cookie):
     status_code, status = request(
         f"{BASE_URL}/api/user/status",
         "GET",
@@ -240,28 +192,46 @@ def checkin(cookie, index):
     )
 
     if status_code != 200:
+        return status_code, status
+
+    return status_code, status
+
+
+def checkin(cookie, index):
+    status_code, status = get_user_status(cookie)
+
+    if status_code != 200:
         log(
             f"❌ 账号 {index} 获取状态失败: "
-            f"HTTP {status_code} {status}"
+            f"HTTP {status_code} "
+            f"{json.dumps(status, ensure_ascii=False)}"
         )
 
-        return False, status
+        return False, {
+            "email": "?",
+            "points": "接口未返回",
+            "left_days": "接口未返回",
+            "message": "获取状态失败",
+            "result": status,
+        }
 
-    user_data = get_user_info(status)
+    data = {}
 
-    email = find_value(
-        user_data,
-        {
-            "email",
-            "mail",
-            "username",
-        },
-    ) or "?"
+    if isinstance(status, dict):
+        data = status.get("data", {})
 
-    before_points = get_points(status)
-    before_left_days = get_left_days(status)
+    if not isinstance(data, dict):
+        data = {}
 
-    code, result = request(
+    email = data.get("email", "?")
+
+    # 必须优先读取 leftDays，不能读取 days
+    left_days = data.get("leftDays", "接口未返回")
+
+    # 状态接口中尝试读取积分
+    points = find_points(status)
+
+    checkin_code, checkin_result = request(
         f"{BASE_URL}/api/user/checkin",
         "POST",
         cookie,
@@ -270,61 +240,82 @@ def checkin(cookie, index):
         },
     )
 
-    success = code == 200 and is_success(result)
+    success = (
+        checkin_code == 200
+        and is_success(checkin_result)
+    )
 
     message = (
-        result.get("message", "未知")
-        if isinstance(result, dict)
-        else str(result)
+        checkin_result.get("message", "未知")
+        if isinstance(checkin_result, dict)
+        else str(checkin_result)
     )
 
-    # 签到后重新获取状态，确保显示最新积分和天数
-    latest_points = before_points
-    latest_left_days = before_left_days
+    # 如果状态接口没有积分，尝试从签到接口返回内容中读取
+    if points is None:
+        points = find_points(checkin_result)
 
-    latest_status_code, latest_status = request(
-        f"{BASE_URL}/api/user/status",
-        "GET",
-        cookie,
-    )
+    # 签到后再次获取状态，读取最新天数和积分
+    latest_status_code, latest_status = get_user_status(cookie)
 
     if latest_status_code == 200:
-        latest_points = get_points(latest_status)
-        latest_left_days = get_left_days(latest_status)
+        latest_data = {}
+
+        if isinstance(latest_status, dict):
+            latest_data = latest_status.get("data", {})
+
+        if not isinstance(latest_data, dict):
+            latest_data = {}
+
+        # 仍然只读取 leftDays，不读取 days
+        latest_left_days = latest_data.get("leftDays")
+
+        if latest_left_days is not None:
+            left_days = latest_left_days
+
+        latest_points = find_points(latest_status)
+
+        if latest_points is not None:
+            points = latest_points
+
+    if points is None:
+        points = "接口未返回"
 
     icon = "✅" if success else "❌"
 
     log(
         f"{icon} 用户: {email} | "
-        f"积分: {latest_points} | "
-        f"天数: {latest_left_days} | "
+        f"积分: {points} | "
+        f"天数: {left_days} | "
         f"结果: {message}"
     )
 
-    if latest_points == "?":
+    # 积分没有返回时，打印签到接口响应，方便确认真实字段
+    if points == "接口未返回":
         log(
-            "⚠️ 接口返回中没有识别到积分字段，"
-            "请检查上面的接口返回数据。"
+            "⚠️ 当前接口没有返回积分字段。"
+            "签到接口返回内容如下："
         )
 
-        if isinstance(status, dict):
-            log(
-                "状态接口返回字段: "
-                + json.dumps(status, ensure_ascii=False)
+        log(
+            json.dumps(
+                checkin_result,
+                ensure_ascii=False
             )
+        )
 
     if not success:
         log(
-            f"响应详情: HTTP {code}, "
-            f"{json.dumps(result, ensure_ascii=False)}"
+            f"响应详情: HTTP {checkin_code}, "
+            f"{json.dumps(checkin_result, ensure_ascii=False)}"
         )
 
     return success, {
         "email": email,
-        "points": latest_points,
-        "left_days": latest_left_days,
+        "points": points,
+        "left_days": left_days,
         "message": message,
-        "result": result,
+        "result": checkin_result,
     }
 
 
@@ -375,27 +366,10 @@ def main():
                 f"{html.escape(str(info.get('email', '?')))}"
                 f"<br>"
                 f"<b>当前积分:</b> "
-                f"{html.escape(str(info.get('points', '?')))}"
+                f"{html.escape(str(info.get('points', '接口未返回')))}"
                 f"<br>"
                 f"<b>剩余天数:</b> "
-                f"{html.escape(str(info.get('left_days', '?')))}"
+                f"{html.escape(str(info.get('left_days', '接口未返回')))}"
                 f"<br>"
                 f"<b>结果:</b> "
                 f"{html.escape(str(info.get('message', '?')))}"
-                f"</p>"
-            )
-
-    token = os.environ.get("PUSHPLUS_TOKEN", "")
-
-    if token:
-        pushplus(
-            token,
-            f"GLaDOS签到: 成功{success_count}/{len(cookies)}",
-            "".join(reports) or "没有可推送的结果",
-        )
-
-    return 0 if success_count == len(cookies) else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
