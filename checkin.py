@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-GLaDOS 自动签到脚本（积分 + 剩余天数 + QQ 邮件通知版）
+GLaDOS 自动签到脚本
 
 功能：
-1. 支持多账号签到
+1. 多账号签到
 2. 自动切换备用域名
-3. 获取用户邮箱和会员剩余天数
-4. 获取当前积分和最近积分变化
-5. 自动执行签到
-6. 支持 PushPlus 推送
-7. 至少一个账号签到成功时，发送 QQ 邮件通知
+3. 查询会员剩余天数
+4. 查询签到前后积分
+5. 显示本次实际签到奖励
+6. 只有本次获得签到积分时才发送 QQ 邮件
+7. 支持 PushPlus
+8. 日志和邮件时间统一使用北京时间
 
-GitHub Secrets / 环境变量：
+环境变量：
 GLADOS_COOKIE
 GLADOS_USER_AGENT（可选）
 PUSHPLUS_TOKEN（可选）
@@ -23,9 +25,12 @@ QQ_MAIL_TO（可选）
 
 import os
 import sys
+import re
 import time
 import smtplib
+
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.header import Header
 
@@ -54,26 +59,28 @@ HEADERS_BASE = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
-# ================= 日志 =================
+
+def now_str():
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def log(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{now_str()}] {msg}")
 
 
-# ================= 获取多账号 Cookie =================
+# ================= Cookie =================
 
-def get_cookies() -> list:
+def get_cookies():
     raw = os.environ.get("GLADOS_COOKIE", "").strip()
 
     if not raw:
-        log("❌ 未配置环境变量 GLADOS_COOKIE")
+        log("❌ 未配置 GLADOS_COOKIE")
         return []
 
-    # 支持换行或 & 分隔多个账号
     if "\n" in raw:
-        items = raw.split("\n")
+        items = raw.splitlines()
     else:
         items = raw.split("&")
 
@@ -85,7 +92,6 @@ def get_cookies() -> list:
         if not cookie:
             continue
 
-        # 去掉可能误复制的 Cookie: 前缀
         if cookie.lower().startswith("cookie:"):
             cookie = cookie[7:].strip()
 
@@ -98,127 +104,138 @@ def get_cookies() -> list:
 
 class GLaDOS:
 
-    def __init__(self, cookie: str):
+    def __init__(self, cookie):
         self.cookie = cookie
         self.domain = DOMAINS[0]
-        self.email = "?"
-        self.left_days = "?"
-        self.points = "?"
-        self.points_change = ""
 
-    def _request(self, method: str, path: str, data=None):
-        """
-        请求 GLaDOS API。
-        请求失败时尝试其他域名。
-        """
+        self.email = "Unknown"
+        self.left_days = "?"
+        self.points_before = None
+        self.points_after = None
+        self.reward_points = None
+
+        self.session = requests.Session()
+
+    def _request(self, method, path, data=None):
 
         for domain in DOMAINS:
+
             try:
                 url = f"{domain}{path}"
 
                 headers = HEADERS_BASE.copy()
                 headers["User-Agent"] = os.environ.get(
-                    "GLADOS_USER_AGENT", DEFAULT_UA
+                    "GLADOS_USER_AGENT",
+                    DEFAULT_UA
                 )
                 headers["Cookie"] = self.cookie
                 headers["Origin"] = domain
                 headers["Referer"] = f"{domain}/console/checkin"
 
                 if method.upper() == "GET":
-                    resp = requests.get(
+                    response = self.session.get(
                         url,
                         headers=headers,
                         timeout=12
                     )
                 else:
-                    resp = requests.post(
+                    response = self.session.post(
                         url,
                         headers=headers,
                         json=data,
                         timeout=12
                     )
 
-                if resp.status_code == 200:
-                    try:
-                        result = resp.json()
-                    except ValueError:
-                        log(f"⚠️ {domain} 返回的不是有效 JSON")
-                        continue
+                if response.status_code != 200:
+                    log(
+                        f"⚠️ {domain} 返回 HTTP "
+                        f"{response.status_code}"
+                    )
+                    continue
 
-                    self.domain = domain
-                    return result
+                try:
+                    result = response.json()
+                except ValueError:
+                    log(f"⚠️ {domain} 返回的不是有效 JSON")
+                    continue
 
-                log(f"⚠️ {domain} 返回 HTTP {resp.status_code}")
+                self.domain = domain
+                return result
 
-            except requests.RequestException as e:
-                log(f"⚠️ {domain} 请求失败: {e}")
-                continue
+            except requests.RequestException as exc:
+                log(
+                    f"⚠️ {domain} 请求失败："
+                    f"{type(exc).__name__}"
+                )
 
         return None
 
-    def get_status(self) -> bool:
-        """获取用户邮箱和会员剩余天数"""
+    def get_status(self):
 
-        res = self._request("GET", "/api/user/status")
+        result = self._request(
+            "GET",
+            "/api/user/status"
+        )
 
-        if (
-            isinstance(res, dict)
-            and res.get("code") == 0
-            and isinstance(res.get("data"), dict)
-        ):
-            data = res["data"]
-
-            self.email = data.get("email", "Unknown")
-
-            left = data.get("leftDays", "?")
-
-            if left is not None:
-                self.left_days = str(left).split(".")[0]
-
-            return True
-
-        return False
-
-    def get_points(self) -> bool:
-        """获取当前积分和最近一次积分变化"""
-
-        res = self._request("GET", "/api/user/points")
-
-        if not isinstance(res, dict):
+        if not isinstance(result, dict):
             return False
 
-        points = res.get("points")
-
-        data = res.get("data")
-
-        if points is None and isinstance(data, dict):
-            points = data.get("points")
-
-        if points is None:
+        if result.get("code") != 0:
             return False
 
-        self.points = str(points).split(".")[0]
+        data = result.get("data")
 
-        history = res.get("history")
+        if not isinstance(data, dict):
+            return False
 
-        if history is None and isinstance(data, dict):
-            history = data.get("history")
+        self.email = data.get("email", "Unknown")
 
-        if isinstance(history, list) and history:
-            first = history[0]
+        left_days = data.get("leftDays")
 
-            if isinstance(first, dict):
-                change = str(first.get("change", "0")).split(".")[0]
-
-                if change and not change.startswith("-") and change != "0":
-                    change = "+" + change
-
-                self.points_change = change
+        if left_days is not None:
+            try:
+                self.left_days = str(int(float(left_days)))
+            except (TypeError, ValueError):
+                self.left_days = str(left_days)
 
         return True
 
+    def get_points(self):
+        """
+        查询积分。
+
+        兼容两种常见返回结构：
+        {"points": 100}
+        {"data": {"points": 100}}
+
+        如果实际接口格式不同，需要根据真实响应调整。
+        """
+
+        result = self._request(
+            "GET",
+            "/api/user/points"
+        )
+
+        if not isinstance(result, dict):
+            return None
+
+        points = result.get("points")
+
+        if points is None:
+            data = result.get("data")
+
+            if isinstance(data, dict):
+                points = data.get("points")
+
+        if points is None:
+            return None
+
+        try:
+            return int(float(points))
+        except (TypeError, ValueError):
+            return None
+
     def checkin(self):
-        """执行签到"""
 
         return self._request(
             "POST",
@@ -227,59 +244,110 @@ class GLaDOS:
         )
 
 
-# ================= PushPlus 推送 =================
+# ================= 签到奖励解析 =================
 
-def pushplus(token: str, title: str, content: str):
-    """发送 PushPlus 通知"""
+def parse_reward(result):
+    """
+    从签到接口返回的 message 中提取奖励积分。
+
+    例如：
+    Checkin! Got 5 Points -> 5
+
+    没有明确奖励信息则返回 None。
+    """
+
+    if not isinstance(result, dict):
+        return None
+
+    message = result.get("message", "")
+
+    if not isinstance(message, str):
+        return None
+
+    match = re.search(
+        r"\bGot\s+(\d+)\s+Points?\b",
+        message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def is_rewarded(result):
+    """
+    只有签到结果明确包含正数积分奖励时才认定获得奖励。
+    """
+
+    reward = parse_reward(result)
+
+    return reward is not None and reward > 0
+
+
+# ================= PushPlus =================
+
+def pushplus(token, title, content):
 
     if not token:
         return
 
     try:
-        url = "https://www.pushplus.plus/send"
-
-        resp = requests.get(
-            url,
+        response = requests.get(
+            "https://www.pushplus.plus/send",
             params={
                 "token": token,
                 "title": title,
                 "content": content,
                 "template": "html",
             },
-            timeout=8,
+            timeout=10
         )
 
-        if resp.status_code == 200:
+        if response.status_code == 200:
             log("✅ PushPlus 请求已发送")
         else:
-            log(f"⚠️ PushPlus 返回 HTTP {resp.status_code}")
+            log(
+                f"⚠️ PushPlus 返回 HTTP "
+                f"{response.status_code}"
+            )
 
-    except requests.RequestException as e:
-        log(f"❌ PushPlus 推送失败: {e}")
+    except requests.RequestException as exc:
+        log(f"❌ PushPlus 发送失败：{type(exc).__name__}")
 
 
-# ================= QQ 邮件通知 =================
+# ================= QQ 邮件 =================
 
-def send_qq_mail(subject: str, content: str) -> bool:
-    """
-    通过 QQ 邮箱 SMTP 服务发送通知。
+def send_qq_mail(subject, content):
 
-    所需环境变量：
-    QQ_SMTP_USER
-    QQ_SMTP_AUTH_CODE
-    QQ_MAIL_TO
-    """
+    smtp_user = os.environ.get(
+        "QQ_SMTP_USER", ""
+    ).strip()
 
-    smtp_user = os.environ.get("QQ_SMTP_USER", "").strip()
-    smtp_auth_code = os.environ.get("QQ_SMTP_AUTH_CODE", "").strip()
-    mail_to = os.environ.get("QQ_MAIL_TO", "").strip()
+    smtp_auth_code = os.environ.get(
+        "QQ_SMTP_AUTH_CODE", ""
+    ).strip()
+
+    mail_to = os.environ.get(
+        "QQ_MAIL_TO", ""
+    ).strip()
 
     if not smtp_user or not smtp_auth_code or not mail_to:
-        log("⚠️ QQ 邮件配置不完整，跳过邮件通知")
+        log("⚠️ QQ 邮件配置不完整")
         return False
 
-    message = MIMEText(content, "plain", "utf-8")
-    message["Subject"] = Header(subject, "utf-8")
+    message = MIMEText(
+        content,
+        "plain",
+        "utf-8"
+    )
+
+    message["Subject"] = Header(
+        subject,
+        "utf-8"
+    )
+
     message["From"] = smtp_user
     message["To"] = mail_to
 
@@ -290,7 +358,10 @@ def send_qq_mail(subject: str, content: str) -> bool:
             timeout=15
         ) as server:
 
-            server.login(smtp_user, smtp_auth_code)
+            server.login(
+                smtp_user,
+                smtp_auth_code
+            )
 
             server.sendmail(
                 smtp_user,
@@ -301,41 +372,12 @@ def send_qq_mail(subject: str, content: str) -> bool:
         log("✅ QQ 邮件发送成功")
         return True
 
-    except Exception as e:
-        # 不输出授权码或 Cookie
-        log(f"❌ QQ 邮件发送失败: {type(e).__name__}: {e}")
+    except Exception as exc:
+        log(
+            f"❌ QQ 邮件发送失败："
+            f"{type(exc).__name__}"
+        )
         return False
-
-
-# ================= 判断签到结果 =================
-
-def is_checkin_success(checkin_res) -> bool:
-    """
-    根据接口返回的 message 判断签到结果。
-
-    注意：
-    此处沿用原脚本的关键词判断方式。
-    如果 GLaDOS API 返回格式发生变化，需要相应调整。
-    """
-
-    if not isinstance(checkin_res, dict):
-        return False
-
-    msg = checkin_res.get("message", "")
-
-    if not isinstance(msg, str):
-        return False
-
-    msg_lower = msg.lower()
-
-    success_keywords = [
-        "checkin",
-        "observation logged",
-        "got",
-        "repeats",
-    ]
-
-    return any(keyword in msg_lower for keyword in success_keywords)
 
 
 # ================= 主程序 =================
@@ -347,133 +389,205 @@ def main():
     if not cookies:
         sys.exit(1)
 
-    log(f"🚀 GLaDOS 签到开始，共 {len(cookies)} 个账号")
+    log(
+        f"🚀 GLaDOS 签到开始，共 "
+        f"{len(cookies)} 个账号"
+    )
 
     results = []
-    success_count = 0
+    mail_results = []
 
-    for idx, cookie in enumerate(cookies, 1):
+    rewarded_count = 0
+    failed_count = 0
+
+    for index, cookie in enumerate(cookies, 1):
 
         g = GLaDOS(cookie)
 
-        # 1. 查询账号状态
+        # 1. 获取账号状态
         if not g.get_status():
-            log(f"❌ 账号 {idx} 状态查询失败（Cookie 可能失效）")
 
-            results.append(
-                f"❌ 账号 {idx}\n"
-                f"状态查询失败，Cookie 可能失效"
+            log(
+                f"❌ 账号 {index} 状态查询失败"
             )
 
-            if idx < len(cookies):
+            results.append(
+                f"❌ 账号 {index}：状态查询失败"
+            )
+
+            failed_count += 1
+
+            if index < len(cookies):
                 time.sleep(1.5)
 
             continue
 
-        # 2. 查询积分
-        g.get_points()
+        # 2. 查询签到前积分
+        g.points_before = g.get_points()
 
         # 3. 执行签到
-        checkin_res = g.checkin()
+        checkin_result = g.checkin()
 
-        if not isinstance(checkin_res, dict):
-            msg = "签到请求失败"
+        if not isinstance(checkin_result, dict):
 
             log(
-                f"❌ 用户: {g.email} | "
-                f"积分: {g.points} | "
-                f"天数: {g.left_days} | "
-                f"结果: {msg}"
+                f"❌ 用户 {g.email} "
+                f"签到请求失败"
             )
 
             results.append(
                 f"❌ {g.email}\n"
-                f"当前积分: {g.points}\n"
-                f"剩余天数: {g.left_days} 天\n"
-                f"签到结果: {msg}"
+                f"签到请求失败"
             )
 
-        else:
-            msg = checkin_res.get("message", "未知结果")
+            failed_count += 1
 
-            if not isinstance(msg, str):
-                msg = str(msg)
+            if index < len(cookies):
+                time.sleep(1.5)
 
-            success = is_checkin_success(checkin_res)
+            continue
 
-            if success:
-                success_count += 1
-                status_icon = "✅"
-                status_text = "成功"
+        message = checkin_result.get(
+            "message",
+            "未知结果"
+        )
+
+        if not isinstance(message, str):
+            message = str(message)
+
+        # 4. 只识别明确返回的本次奖励
+        g.reward_points = parse_reward(
+            checkin_result
+        )
+
+        if g.reward_points is not None and g.reward_points > 0:
+
+            rewarded_count += 1
+
+            # 5. 签到后重新查询积分
+            # 给服务器一点时间更新数据
+            time.sleep(1)
+
+            g.points_after = g.get_points()
+
+            if g.points_before is None:
+                before_text = "未知"
             else:
-                status_icon = "⚠️"
-                status_text = "未确认成功"
+                before_text = str(g.points_before)
 
-            change_str = (
-                f" ({g.points_change})"
-                if g.points_change
-                else ""
-            )
+            if g.points_after is None:
+                after_text = "查询失败"
+            else:
+                after_text = str(g.points_after)
+
+            if g.points_before is not None and g.points_after is not None:
+
+                actual_change = (
+                    g.points_after - g.points_before
+                )
+
+                change_text = f"{actual_change:+d}"
+
+            else:
+                change_text = "未能计算"
 
             log(
-                f"{status_icon} 用户: {g.email} | "
-                f"积分: {g.points}{change_str} | "
+                f"✅ 用户: {g.email} | "
+                f"签到前积分: {before_text} | "
+                f"本次奖励: +{g.reward_points} | "
+                f"签到后积分: {after_text} | "
+                f"天数: {g.left_days}"
+            )
+
+            detail = (
+                f"账号：{g.email}\n"
+                f"签到状态：成功，获得奖励\n"
+                f"签到前积分：{before_text}\n"
+                f"本次签到奖励：+{g.reward_points}\n"
+                f"签到后积分：{after_text}\n"
+                f"积分实际变化：{change_text}\n"
+                f"会员剩余天数：{g.left_days} 天\n"
+                f"签到结果：{message}\n"
+                f"签到时间：{now_str()}"
+            )
+
+            results.append(detail)
+            mail_results.append(detail)
+
+        else:
+
+            # 今日已签到、未获得奖励，或者返回结果不明确
+            g.points_after = None
+
+            log(
+                f"ℹ️ 用户: {g.email} | "
+                f"本次没有检测到明确的积分奖励 | "
                 f"天数: {g.left_days} | "
-                f"结果: {msg}"
+                f"结果: {message}"
             )
 
             results.append(
-                f"{status_icon} {g.email}\n"
-                f"签到状态: {status_text}\n"
-                f"当前积分: {g.points}{change_str}\n"
-                f"剩余天数: {g.left_days} 天\n"
-                f"签到结果: {msg}"
+                f"ℹ️ {g.email}\n"
+                f"本次没有检测到明确的积分奖励\n"
+                f"剩余天数：{g.left_days} 天\n"
+                f"签到结果：{message}"
             )
 
-        # 限速，避免请求过快
-        if idx < len(cookies):
+        if index < len(cookies):
             time.sleep(1.5)
 
-    # 4. PushPlus 推送汇总
-    ptoken = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+    # 6. PushPlus 汇总
+    push_token = os.environ.get(
+        "PUSHPLUS_TOKEN", ""
+    ).strip()
 
-    if ptoken and results:
-        title = f"GLaDOS 签到 {success_count}/{len(cookies)}"
+    if push_token and results:
 
-        content = "<br><br>".join(
+        push_content = "<br><br>".join(
             result.replace("\n", "<br>")
             for result in results
         )
 
-        pushplus(ptoken, title, content)
-
-    # 5. QQ 邮件通知
-    # 只有至少一个账号被判定为签到成功时才发送
-    if success_count > 0:
-
-        mail_content = (
-            "GLaDOS 自动签到通知\n"
-            "==============================\n\n"
-            f"签到时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"账号总数：{len(cookies)}\n"
-            f"成功账号数：{success_count}\n\n"
-            "各账号签到详情：\n\n"
-            + "\n\n------------------------------\n\n".join(results)
+        pushplus(
+            push_token,
+            f"GLaDOS 签到奖励 {rewarded_count}/{len(cookies)}",
+            push_content
         )
 
-        send_qq_mail(
-            subject=f"GLaDOS 签到通知：成功 {success_count}/{len(cookies)}",
-            content=mail_content
-        )
+    # 7. 只有获得明确积分奖励的账号才发 QQ 邮件
+    # 每个获得奖励的账号分别发送一封邮件
+    if mail_results:
+
+        for detail in mail_results:
+
+            first_line = detail.splitlines()[0]
+
+            send_qq_mail(
+                subject=f"GLaDOS 签到奖励通知 - {first_line}",
+                content=(
+                    "GLaDOS 自动签到奖励通知\n"
+                    "==============================\n\n"
+                    + detail
+                )
+            )
 
     else:
-        log("ℹ️ 没有确认签到成功的账号，本次不发送 QQ 邮件")
+        log(
+            "ℹ️ 本次没有账号获得明确的签到积分奖励，"
+            "不发送 QQ 邮件"
+        )
 
-    # 6. 完成
-    log(f"🏁 完成，成功 {success_count}/{len(cookies)}")
+    log(
+        f"🏁 完成：获得签到奖励 "
+        f"{rewarded_count}/{len(cookies)}，"
+        f"失败 {failed_count}"
+    )
 
-    # 只要有一个账号被判定成功，就返回 0
-    sys.exit(0 if success_count > 0 else 1)
+    # 只要至少一个账号明确获得奖励，就返回成功
+    sys.exit(
+        0 if rewarded_count > 0 else
+        (1 if failed_count == len(cookies) else 0)
+    )
 
 
 if __name__ == "__main__":
