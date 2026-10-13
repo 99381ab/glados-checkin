@@ -1,0 +1,81 @@
+name: GLaDOS 2026 Checkin
+
+on:
+  schedule:
+    # 北京时间 09:30（UTC 01:30）
+    - cron: '30 1 * * *'
+    # 北京时间 21:30（UTC 13:30）
+    - cron: '30 13 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 配置 Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. 检查 Cookie 文件
+      - name: Check Cookie File
+        run: |
+          if [ ! -f cookies.txt ]; then
+            echo "❌ 找不到 cookies.txt，请确认它在仓库根目录"
+            exit 1
+          fi
+
+          if ! grep -q '[^[:space:]]' cookies.txt; then
+            echo "❌ cookies.txt 是空文件"
+            exit 1
+          fi
+
+          echo "✅ Cookie 文件存在"
+
+      # 4. 安装依赖
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      # 5. 执行自动签到
+      - name: Run Checkin
+        id: run_checkin
+        continue-on-error: true
+        run: python checkin.py
+        timeout-minutes: 5
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          QQ_SMTP_USER: ${{ secrets.QQ_SMTP_USER }}
+          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+          QQ_MAIL_TO: ${{ secrets.QQ_MAIL_TO }}
+
+      # 6. 第一次签到失败后，等待 60 秒并重试
+      - name: Retry on Failure
+        if: steps.run_checkin.outcome == 'failure'
+        run: |
+          echo "第一次签到失败，60 秒后重试..."
+          sleep 60
+          python checkin.py
+        timeout-minutes: 5
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          QQ_SMTP_USER: ${{ secrets.QQ_SMTP_USER }}
+          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+          QQ_MAIL_TO: ${{ secrets.QQ_MAIL_TO }}
+
+      # 7. 删除本次运行环境中的 Cookie 文件副本
+      - name: Remove Cookie File
+        if: always()
+        run: rm -f cookies.txt
