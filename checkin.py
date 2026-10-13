@@ -5,7 +5,7 @@
 GLaDOS 自动签到脚本
 
 功能：
-1. 多账号签到
+1. 多账号签到，从 cookies.txt 读取 Cookie
 2. 自动切换备用域名
 3. 查询会员剩余天数
 4. 查询签到前后积分
@@ -13,6 +13,7 @@ GLaDOS 自动签到脚本
 6. 只有获得明确积分奖励时才发送 QQ 邮件
 7. 支持 PushPlus 推送
 8. 使用北京时间
+9. 每个账号使用固定编号，避免邮箱被隐藏后无法区分
 """
 
 import os
@@ -70,43 +71,67 @@ def log(msg: str):
 
 def get_cookies():
     """
-    从 checkin.py 同目录下的 cookies.txt 读取 Cookie。
-    每行一个账号；忽略空行、# 开头的注释行，并兼容 Cookie: 前缀。
+    从与 checkin.py 同目录的 cookies.txt 读取 Cookie。
+    每行填写一个账号的完整 Cookie。
+    支持空行、# 注释行和 Cookie: 前缀。
     """
+
+    script_dir = os.path.dirname(
+        os.path.abspath(__file__)
+    )
+
     cookie_file = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
+        script_dir,
         "cookies.txt"
     )
 
     if not os.path.isfile(cookie_file):
-        log("❌ Cookie 文件不存在：请在 checkin.py 同目录创建 cookies.txt")
+        log(
+            "❌ 找不到 cookies.txt，"
+            "请确认它与 checkin.py 在同一目录"
+        )
+        return []
+
+    try:
+        with open(
+            cookie_file,
+            "r",
+            encoding="utf-8-sig"
+        ) as file:
+            lines = file.readlines()
+
+    except OSError as exc:
+        log(
+            f"❌ 读取 cookies.txt 失败："
+            f"{type(exc).__name__}"
+        )
         return []
 
     cookies = []
 
-    try:
-        with open(cookie_file, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                cookie = line.strip()
+    for line in lines:
+        cookie = line.strip()
 
-                if not cookie or cookie.startswith("#"):
-                    continue
+        # 跳过空行和注释行
+        if not cookie or cookie.startswith("#"):
+            continue
 
-                if cookie.lower().startswith("cookie:"):
-                    cookie = cookie[7:].strip()
+        # 兼容 Cookie: xxx 的格式
+        if cookie.lower().startswith("cookie:"):
+            cookie = cookie[7:].strip()
 
-                if cookie:
-                    cookies.append(cookie)
-
-    except OSError as exc:
-        log(f"❌ Cookie 文件读取失败：{type(exc).__name__}")
-        return []
+        if cookie:
+            cookies.append(cookie)
 
     if not cookies:
-        log("❌ cookies.txt 中没有有效的 Cookie")
+        log("❌ cookies.txt 中没有读取到有效 Cookie")
         return []
 
-    log(f"✅ 从 cookies.txt 读取到 {len(cookies)} 个 Cookie")
+    log(
+        f"✅ 已从 cookies.txt 读取 "
+        f"{len(cookies)} 个账号"
+    )
+
     return cookies
 
 
@@ -222,10 +247,8 @@ class GLaDOS:
         if not isinstance(data, dict):
             return False
 
-        self.email = data.get(
-            "email",
-            "Unknown"
-        )
+        # 邮箱缺失或为空时，使用 Unknown
+        self.email = data.get("email") or "Unknown"
 
         left_days = data.get("leftDays")
 
@@ -481,16 +504,19 @@ def main():
 
         g = GLaDOS(cookie)
 
+        # 固定账号编号，不依赖邮箱是否正常显示
+        account_label = f"账号 {index}"
+
         # 1. 查询账号状态
         if not g.get_status():
 
             log(
-                f"❌ 账号 {index} 状态查询失败，"
+                f"❌ {account_label} 状态查询失败，"
                 f"Cookie 可能失效"
             )
 
             results.append(
-                f"❌ 账号 {index}：状态查询失败"
+                f"❌ {account_label}：状态查询失败"
             )
 
             failed_count += 1
@@ -500,13 +526,18 @@ def main():
 
             continue
 
+        # 统一账号显示格式
+        account_display = (
+            f"{account_label}（{g.email}）"
+        )
+
         # 2. 查询签到前积分
         g.points_before = g.get_points()
 
         if g.points_before is None:
 
             log(
-                f"⚠️ 用户 {g.email} "
+                f"⚠️ {account_display} "
                 f"签到前积分查询失败"
             )
 
@@ -516,7 +547,7 @@ def main():
         if not isinstance(checkin_result, dict):
 
             log(
-                f"❌ 用户 {g.email} "
+                f"❌ {account_display} "
                 f"签到请求失败"
             )
 
@@ -530,7 +561,7 @@ def main():
             )
 
             results.append(
-                f"❌ {g.email}\n"
+                f"❌ {account_display}\n"
                 f"签到请求失败\n"
                 f"当前积分：{points_text}\n"
                 f"剩余天数：{g.left_days} 天"
@@ -601,7 +632,7 @@ def main():
             reward_text = f"+{g.reward_points}"
 
             log(
-                f"✅ 用户: {g.email} | "
+                f"✅ 用户: {account_display} | "
                 f"签到前积分: {before_text} | "
                 f"本次奖励: {reward_text} | "
                 f"签到后积分: {after_text} | "
@@ -617,7 +648,7 @@ def main():
             reward_text = "0"
 
             log(
-                f"ℹ️ 用户: {g.email} | "
+                f"ℹ️ 用户: {account_display} | "
                 f"签到状态: 今日已签到 | "
                 f"当前积分: {after_text} | "
                 f"本次奖励: 0 | "
@@ -633,7 +664,7 @@ def main():
             reward_text = "未知"
 
             log(
-                f"⚠️ 用户: {g.email} | "
+                f"⚠️ 用户: {account_display} | "
                 f"签到状态: {status_text} | "
                 f"当前积分: {after_text} | "
                 f"本次奖励: 未知 | "
@@ -644,7 +675,7 @@ def main():
 
         # 9. 生成账号详情
         detail = (
-            f"账号：{g.email}\n"
+            f"账号：{account_display}\n"
             f"签到状态：{status_text}\n"
             f"签到前积分：{before_text}\n"
             f"本次获得积分：{reward_text}\n"
@@ -696,7 +727,6 @@ def main():
         mail_content = (
             "GLaDOS 自动签到奖励通知\n"
             "================================\n\n"
-            + "\n\n"
             + "\n\n--------------------------------\n\n".join(
                 mail_results
             )
